@@ -1,0 +1,1333 @@
+# GitHub Repository Setup for Raspberry Pi Travel Router & NAS Project
+
+# .github/workflows/main.yml - Main CI/CD Pipeline
+name: Pi Travel Router CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  release:
+    types: [ published ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Job 1: Code Quality and Security
+  code-quality:
+    runs-on: ubuntu-latest
+    name: Code Quality & Security
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run Shell Script Linting
+        run: |
+          find . -name "*.sh" -exec shellcheck {} \;
+
+      - name: Run Python Code Formatting Check
+        run: |
+          black --check --diff scripts/
+          isort --check-only --diff scripts/
+
+      - name: Run Security Scan
+        run: |
+          bandit -r scripts/ -f json -o bandit-report.json || true
+          safety check --json > safety-report.json || true
+
+      - name: Run Ansible Linting
+        run: |
+          ansible-lint ansible/
+
+      - name: Upload Security Reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-reports
+          path: |
+            bandit-report.json
+            safety-report.json
+
+  # Job 2: Raspberry Pi Emulation Testing
+  pi-emulation-test:
+    runs-on: ubuntu-latest
+    name: Pi Emulation Testing
+    needs: code-quality
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup QEMU for ARM Emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Test ARM64 Compatibility
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v ${{ github.workspace }}:/workspace \
+            arm64v8/python:3.11-slim \
+            bash -c "cd /workspace && python -m py_compile scripts/*.py"
+
+      - name: Test Installation Scripts
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v ${{ github.workspace }}:/workspace \
+            arm64v8/debian:bullseye \
+            bash -c "cd /workspace && bash scripts/test-install.sh"
+
+  # Job 3: Documentation Build
+  documentation:
+    runs-on: ubuntu-latest
+    name: Build Documentation
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python for MkDocs
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Documentation Tools
+        run: |
+          pip install mkdocs mkdocs-material mkdocs-mermaid2-plugin
+
+      - name: Build Documentation
+        run: |
+          mkdocs build --clean --strict
+
+      - name: Test Documentation Links
+        run: |
+          pip install linkchecker
+          linkchecker --check-extern site/
+
+      - name: Deploy Documentation
+        if: github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+
+  # Job 4: Hardware Compatibility Testing
+  hardware-compatibility:
+    runs-on: ubuntu-latest
+    name: Hardware Compatibility
+    strategy:
+      matrix:
+        pi_model: [3b-plus, 4b-2gb, 4b-4gb, 4b-8gb]
+        router_model: [netgear-r6230, glinet-ax1800, tplink-ac1200]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Compatibility Tests
+        run: |
+          python scripts/test-hardware-compatibility.py \
+            --pi-model ${{ matrix.pi_model }} \
+            --router-model ${{ matrix.router_model }}
+
+      - name: Generate Compatibility Report
+        run: |
+          python scripts/generate-compatibility-report.py \
+            --pi-model ${{ matrix.pi_model }} \
+            --router-model ${{ matrix.router_model }} \
+            --output compatibility-${{ matrix.pi_model }}-${{ matrix.router_model }}.json
+
+      - name: Upload Compatibility Data
+        uses: actions/upload-artifact@v3
+        with:
+          name: compatibility-reports
+          path: compatibility-*.json
+
+  # Job 5: Configuration Validation
+  config-validation:
+    runs-on: ubuntu-latest
+    name: Configuration Validation
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Validate Ansible Playbooks
+        run: |
+          pip install ansible-core
+          ansible-playbook --syntax-check ansible/site.yml
+
+      - name: Validate YAML Configurations
+        run: |
+          pip install pyyaml
+          python -c "
+          import yaml
+          import os
+          for root, dirs, files in os.walk('configs'):
+              for file in files:
+                  if file.endswith('.yml') or file.endswith('.yaml'):
+                      with open(os.path.join(root, file)) as f:
+                          yaml.safe_load(f)
+          "
+
+      - name: Test Docker Compose Files
+        run: |
+          docker-compose -f docker/docker-compose.yml config
+          docker-compose -f docker/docker-compose.test.yml config
+
+  # Job 6: Performance Benchmarking
+  performance-benchmark:
+    runs-on: ubuntu-latest
+    name: Performance Benchmarking
+    needs: [pi-emulation-test]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Performance Testing
+        run: |
+          pip install pytest-benchmark
+          sudo apt-get update
+          sudo apt-get install -y stress-ng
+
+      - name: Run Performance Tests
+        run: |
+          python -m pytest tests/performance/ --benchmark-json=benchmark.json
+
+      - name: Upload Benchmark Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-benchmarks
+          path: benchmark.json
+
+  # Job 7: Security Scanning
+  security-scan:
+    runs-on: ubuntu-latest
+    name: Security Scanning
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy Filesystem Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          format: 'sarif'
+          output: 'trivy-fs-results.sarif'
+
+      - name: Upload Trivy Results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-fs-results.sarif'
+
+      - name: Scan Docker Images
+        run: |
+          docker build -t pi-travel-router:test docker/
+          trivy image pi-travel-router:test
+
+  # Job 8: Release Package Creation
+  release-package:
+    runs-on: ubuntu-latest
+    name: Create Release Package
+    if: github.event_name == 'release'
+    needs: [code-quality, pi-emulation-test, config-validation]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Create Installation Package
+        run: |
+          mkdir -p release-package/pi-travel-router
+          
+          # Copy essential files
+          cp -r scripts/ release-package/pi-travel-router/
+          cp -r configs/ release-package/pi-travel-router/
+          cp -r ansible/ release-package/pi-travel-router/
+          cp -r docs/ release-package/pi-travel-router/
+          cp README.md release-package/pi-travel-router/
+          cp INSTALL.md release-package/pi-travel-router/
+          
+          # Create installation script
+          cat > release-package/pi-travel-router/quick-install.sh << 'EOF'
+          #!/bin/bash
+          echo "Raspberry Pi Travel Router & NAS Quick Install"
+          echo "============================================="
+          
+          # Check for Raspberry Pi
+          if ! grep -q "Raspberry Pi" /proc/cpuinfo; then
+              echo "Warning: This doesn't appear to be a Raspberry Pi"
+              read -p "Continue anyway? (y/N): " -n 1 -r
+              echo
+              if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                  exit 1
+              fi
+          fi
+          
+          # Run main installation
+          bash scripts/install.sh
+          EOF
+          
+          chmod +x release-package/pi-travel-router/quick-install.sh
+          
+          # Create compressed archive
+          cd release-package
+          tar -czf pi-travel-router-${{ github.event.release.tag_name }}.tar.gz pi-travel-router/
+          zip -r pi-travel-router-${{ github.event.release.tag_name }}.zip pi-travel-router/
+
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            release-package/pi-travel-router-${{ github.event.release.tag_name }}.tar.gz
+            release-package/pi-travel-router-${{ github.event.release.tag_name }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+---
+
+# .github/workflows/hardware-test.yml - Hardware-specific Testing
+name: Hardware Testing Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      pi_model:
+        description: 'Raspberry Pi Model'
+        required: true
+        default: '3b-plus'
+        type: choice
+        options:
+        - 3b-plus
+        - 4b-2gb
+        - 4b-4gb
+        - 4b-8gb
+        - zero-2w
+      router_model:
+        description: 'Router Model'
+        required: true
+        default: 'netgear-r6230'
+        type: choice
+        options:
+        - netgear-r6230
+        - glinet-ax1800
+        - tplink-ac1200
+        - asus-ac1200
+      test_scenario:
+        description: 'Test Scenario'
+        required: true
+        default: 'basic'
+        type: choice
+        options:
+        - basic
+        - performance
+        - endurance
+        - travel-simulation
+
+jobs:
+  hardware-test:
+    runs-on: ubuntu-latest
+    name: Test Hardware Configuration
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Test Environment
+        run: |
+          pip install -r requirements-test.txt
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+
+      - name: Run Hardware-Specific Tests
+        run: |
+          python scripts/test-hardware.py \
+            --pi-model ${{ github.event.inputs.pi_model }} \
+            --router-model ${{ github.event.inputs.router_model }} \
+            --scenario ${{ github.event.inputs.test_scenario }}
+
+      - name: Generate Test Report
+        run: |
+          python scripts/generate-test-report.py \
+            --pi-model ${{ github.event.inputs.pi_model }} \
+            --router-model ${{ github.event.inputs.router_model }} \
+            --scenario ${{ github.event.inputs.test_scenario }} \
+            --output test-report.html
+
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: hardware-test-${{ github.event.inputs.pi_model }}-${{ github.event.inputs.router_model }}
+          path: |
+            test-report.html
+            test-results/
+
+---
+
+# .github/workflows/community-contribution.yml - Community Contribution Workflow
+name: Community Contribution Review
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+    types: [opened, synchronize, reopened]
+
+jobs:
+  contribution-review:
+    runs-on: ubuntu-latest
+    name: Review Community Contribution
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Check Contribution Type
+        id: contrib-type
+        run: |
+          if [[ "${{ github.event.pull_request.title }}" == *"[HARDWARE]"* ]]; then
+            echo "type=hardware" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event.pull_request.title }}" == *"[DOCS]"* ]]; then
+            echo "type=documentation" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event.pull_request.title }}" == *"[SCRIPT]"* ]]; then
+            echo "type=script" >> $GITHUB_OUTPUT
+          else
+            echo "type=general" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Hardware Contribution Review
+        if: steps.contrib-type.outputs.type == 'hardware'
+        run: |
+          echo "Reviewing hardware contribution..."
+          python scripts/validate-hardware-addition.py
+
+      - name: Documentation Review
+        if: steps.contrib-type.outputs.type == 'documentation'
+        run: |
+          echo "Reviewing documentation..."
+          markdown-link-check docs/**/*.md
+
+      - name: Script Contribution Review
+        if: steps.contrib-type.outputs.type == 'script'
+        run: |
+          echo "Reviewing script contribution..."
+          shellcheck scripts/*.sh
+          python -m py_compile scripts/*.py
+
+      - name: Community Recognition
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🎉 Thanks for your contribution to the Pi Travel Router project! 
+              
+              Your contribution type: **${{ steps.contrib-type.outputs.type }}**
+              
+              The community appreciates your help in making travel tech more accessible! 🚀`
+            })
+
+---
+
+# Repository Configuration Files
+
+# .gitignore
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Raspberry Pi specific
+*.img
+*.zip
+kernel*.img
+*.dtb
+*.dtbo
+
+# Project specific
+configs/local/
+logs/
+*.log
+secrets/
+.env
+test-results/
+hardware-test-results/
+compatibility-reports/
+
+# SSH keys
+*.pem
+*.key
+id_rsa*
+
+---
+
+# requirements.txt
+ansible>=7.0.0
+pyyaml>=6.0
+jinja2>=3.1.0
+requests>=2.28.0
+paramiko>=3.0.0
+cryptography>=3.4.8
+netaddr>=0.8.0
+psutil>=5.9.0
+
+---
+
+# requirements-dev.txt
+-r requirements.txt
+pytest>=7.0.0
+pytest-benchmark>=4.0.0
+black>=23.0.0
+isort>=5.12.0
+flake8>=6.0.0
+bandit>=1.7.0
+safety>=2.3.0
+mkdocs>=1.4.0
+mkdocs-material>=9.0.0
+mkdocs-mermaid2-plugin>=0.6.0
+ansible-lint>=6.0.0
+shellcheck-py>=0.9.0
+markdown-link-check>=3.11.0
+
+---
+
+# requirements-test.txt
+-r requirements.txt
+pytest>=7.0.0
+pytest-mock>=3.10.0
+responses>=0.23.0
+docker>=6.0.0
+
+---
+
+# docker/Dockerfile - Pi-compatible container
+FROM arm64v8/debian:bullseye-slim
+
+LABEL maintainer="Pi Travel Router Community"
+LABEL description="Raspberry Pi Travel Router & NAS Setup Container"
+
+# Install essential packages
+RUN apt-get update && apt-get install -y \
+    curl \
+    wget \
+    git \
+    python3 \
+    python3-pip \
+    ansible \
+    openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy project files
+COPY scripts/ /opt/pi-travel-router/scripts/
+COPY ansible/ /opt/pi-travel-router/ansible/
+COPY configs/ /opt/pi-travel-router/configs/
+
+# Set working directory
+WORKDIR /opt/pi-travel-router
+
+# Install Python dependencies
+RUN pip3 install -r scripts/requirements.txt
+
+# Create entrypoint script
+RUN echo '#!/bin/bash\necho "Pi Travel Router Setup Container"\nexec "$@"' > /entrypoint.sh && \
+    chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["bash"]
+
+---
+
+# docker/docker-compose.yml - Development environment
+version: '3.8'
+
+services:
+  pi-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../:/workspace
+      - pi-data:/data
+    environment:
+      - DEVELOPMENT=true
+    ports:
+      - "8080:8080"  # Web interface
+      - "8384:8384"  # Syncthing
+      - "32400:32400" # Plex
+    command: bash
+
+  pi-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../tests:/tests
+      - ../scripts:/scripts
+    environment:
+      - TEST_MODE=true
+    command: pytest /tests
+
+volumes:
+  pi-data:
+
+---
+
+# docker/docker-compose.test.yml - Testing environment
+version: '3.8'
+
+services:
+  pi-hardware-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    volumes:
+      - ../tests:/app/tests
+      - ../scripts:/app/scripts
+      - test-results:/app/results
+    environment:
+      - PI_MODEL=3b-plus
+      - ROUTER_MODEL=netgear-r6230
+      - TEST_MODE=true
+    command: python -m pytest /app/tests/hardware/
+
+  network-simulation:
+    image: networkstatic/iperf3
+    command: -s -p 5201
+    ports:
+      - "5201:5201"
+
+  storage-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    volumes:
+      - ../tests:/app/tests
+      - storage-test:/mnt/test-storage
+    command: python -m pytest /app/tests/storage/
+
+volumes:
+  test-results:
+  storage-test:
+
+---
+
+# scripts/setup.sh - Development Environment Setup
+#!/bin/bash
+set -e
+
+echo "🥧 Setting up Pi Travel Router development environment..."
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Function to print colored output
+print_status() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Check if running on Raspberry Pi
+if grep -q "Raspberry Pi" /proc/cpuinfo 2>/dev/null; then
+    print_status "Detected Raspberry Pi hardware"
+    IS_PI=true
+else
+    print_warning "Not running on Raspberry Pi - development mode"
+    IS_PI=false
+fi
+
+# Check for required tools
+print_status "Checking for required tools..."
+
+command -v git >/dev/null 2>&1 || { print_error "Git is required but not installed. Install with: sudo apt install git"; exit 1; }
+command -v python3 >/dev/null 2>&1 || { print_error "Python 3 is required but not installed. Install with: sudo apt install python3"; exit 1; }
+command -v pip3 >/dev/null 2>&1 || { print_error "Pip3 is required but not installed. Install with: sudo apt install python3-pip"; exit 1; }
+
+print_status "All required tools found!"
+
+# Update system packages (Pi only)
+if [ "$IS_PI" = true ]; then
+    print_status "Updating system packages..."
+    sudo apt update && sudo apt upgrade -y
+    sudo apt install -y curl wget vim htop git python3-venv
+fi
+
+# Create virtual environment
+print_status "Creating Python virtual environment..."
+python3 -m venv venv
+source venv/bin/activate
+
+# Install Python dependencies
+print_status "Installing Python dependencies..."
+pip install --upgrade pip
+pip install -r requirements-dev.txt
+
+# Create necessary directories
+print_status "Creating project directories..."
+mkdir -p {configs/local,logs,test-results,hardware-test-results,media-test}
+
+# Copy example configurations
+print_status "Setting up example configurations..."
+if [ -d "configs/examples" ]; then
+    cp -r configs/examples/* configs/local/ 2>/dev/null || true
+fi
+
+# Set up pre-commit hooks if in git repo
+if [ -d ".git" ]; then
+    print_status "Setting up pre-commit hooks..."
+    pip install pre-commit
+    pre-commit install
+fi
+
+# Pi-specific setup
+if [ "$IS_PI" = true ]; then
+    print_status "Performing Raspberry Pi specific setup..."
+    
+    # Enable SSH if not already enabled
+    sudo systemctl enable ssh
+    sudo systemctl start ssh
+    
+    # Configure GPU memory split
+    if ! grep -q "gpu_mem" /boot/config.txt; then
+        echo "gpu_mem=128" | sudo tee -a /boot/config.txt
+        print_status "GPU memory split configured"
+    fi
+    
+    # Install Docker for Pi
+    if ! command -v docker >/dev/null 2>&1; then
+        print_status "Installing Docker for Raspberry Pi..."
+        curl -fsSL https://get.docker.com -o get-docker.sh
+        sudo sh get-docker.sh
+        sudo usermod -aG docker $USER
+        rm get-docker.sh
+        print_status "Docker installed. Please log out and back in for group changes to take effect."
+    fi
+fi
+
+# Create test media files
+print_status "Creating test media files..."
+mkdir -p media-test/{movies,tv,music}
+echo "Test movie file" > media-test/movies/test-movie.txt
+echo "Test TV show file" > media-test/tv/test-show.txt
+echo "Test music file" > media-test/music/test-song.txt
+
+# Generate hardware compatibility report
+print_status "Generating hardware compatibility report..."
+python3 scripts/detect-hardware.py > hardware-compatibility.json
+
+print_status "✅ Setup complete!"
+echo ""
+echo "Next steps:"
+echo "  1. Activate virtual environment: source venv/bin/activate"
+echo "  2. Run tests: make test"
+echo "  3. Check hardware compatibility: cat hardware-compatibility.json"
+if [ "$IS_PI" = true ]; then
+    echo "  4. Install services: sudo bash scripts/install-services.sh"
+    echo "  5. Configure router: Open router web interface and follow setup guide"
+else
+    echo "  4. Test in development mode: make docker-test"
+fi
+echo ""
+echo "🚀 Happy coding!"
+
+---
+
+# scripts/install-services.sh - Pi Service Installation
+#!/bin/bash
+set -e
+
+# This script installs all required services on a Raspberry Pi
+# Run as: sudo bash scripts/install-services.sh
+
+echo "🥧 Installing Pi Travel Router services..."
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+print_status() { echo -e "${GREEN}[INFO]${NC} $1"; }
+print_warning() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+    print_error "Please run as root: sudo $0"
+    exit 1
+fi
+
+# Check if running on Pi
+if ! grep -q "Raspberry Pi" /proc/cpuinfo; then
+    print_warning "Not running on Raspberry Pi - some features may not work"
+fi
+
+# Update system
+print_status "Updating system packages..."
+apt update && apt upgrade -y
+
+# Install essential packages
+print_status "Installing essential packages..."
+apt install -y \
+    curl wget git vim htop \
+    python3 python3-pip python3-venv \
+    docker.io docker-compose \
+    nginx \
+    ufw \
+    fail2ban
+
+# Add pi user to docker group
+usermod -aG docker pi
+
+# Install OpenMediaVault
+print_status "Installing OpenMediaVault..."
+wget -O - https://github.com/OpenMediaVault-Plugin-Developers/installScript/raw/master/install | bash
+
+# Install Pi-hole
+print_status "Installing Pi-hole..."
+curl -sSL https://install.pi-hole.net | bash
+
+# Configure Pi-hole for travel router
+print_status "Configuring Pi-hole..."
+cat > /etc/pihole/custom.list << EOF
+# Local network entries
+192.168.1.100 pi.local pihole.local
+192.168.1.1 router.local
+EOF
+
+# Install Syncthing
+print_status "Installing Syncthing..."
+curl -s https://syncthing.net/release-key.txt | apt-key add -
+echo "deb https://apt.syncthing.net/ syncthing stable" | tee /etc/apt/sources.list.d/syncthing.list
+apt update
+apt install syncthing
+
+# Enable Syncthing for pi user
+systemctl enable syncthing@pi.service
+systemctl start syncthing@pi.service
+
+# Install Plex Media Server
+print_status "Installing Plex Media Server..."
+curl https://downloads.plex.tv/plex-keys/PlexSign.key | apt-key add -
+echo deb https://downloads.plex.tv/repo/deb public main | tee /etc/apt/sources.list.d/plexmediaserver.list
+apt update
+apt install plexmediaserver
+
+# Configure Plex for low-resource Pi
+print_status "Configuring Plex for Raspberry Pi..."
+systemctl stop plexmediaserver
+
+# Create Plex preferences for Pi optimization
+mkdir -p /var/lib/plexmediaserver/Library/Application\ Support/Plex\ Media\ Server
+cat > "/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Preferences.xml" << EOF
+<?xml version="1.0" encoding="utf-8"?>
+<Preferences 
+    TranscoderTempDirectory="/tmp/plex-transcode"
+    TranscoderCanOnlyRemuxVideo="1"
+    TranscoderH264BackgroundPreset="fast"
+    TranscoderDefaultThrottle="99"
+    TranscodingTempDirectory="/tmp/plex-transcode"
+    DisableTLSv1_0="1"
+    secureConnections="1"
+    RelayEnabled="0"
+    autoEmptyTrash="1"
+    ScheduledLibraryUpdateInterval="3600"
+/>
+EOF
+
+chown -R plex:plex /var/lib/plexmediaserver/
+systemctl start plexmediaserver
+systemctl enable plexmediaserver
+
+# Configure firewall
+print_status "Configuring firewall..."
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow ssh
+ufw allow 80/tcp      # Pi-hole web interface
+ufw allow 53          # DNS
+ufw allow 8384/tcp    # Syncthing
+ufw allow 32400/tcp   # Plex
+ufw --force enable
+
+# Configure fail2ban
+print_status "Configuring fail2ban..."
+cat > /etc/fail2ban/jail.local << EOF
+[DEFAULT]
+bantime = 3600
+findtime = 600
+maxretry = 3
+
+[ssh]
+enabled = true
+port = ssh
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 3
+EOF
+
+systemctl enable fail2ban
+systemctl start fail2ban
+
+# Create monitoring script
+print_status "Creating system monitoring script..."
+cat > /usr/local/bin/pi-status.sh << 'EOF'
+#!/bin/bash
+echo "=== Pi Travel Router Status ==="
+echo "Date: $(date)"
+echo "Uptime: $(uptime -p)"
+echo "Temperature: $(vcgencmd measure_temp)"
+echo "Memory: $(free -h | grep Mem)"
+echo "Disk: $(df -h / | tail -1)"
+echo ""
+echo "Service Status:"
+systemctl is-active --quiet plexmediaserver && echo "✅ Plex" || echo "❌ Plex"
+systemctl is-active --quiet syncthing@pi && echo "✅ Syncthing" || echo "❌ Syncthing"
+systemctl is-active --quiet pihole-FTL && echo "✅ Pi-hole" || echo "❌ Pi-hole"
+systemctl is-active --quiet ssh && echo "✅ SSH" || echo "❌ SSH"
+echo ""
+echo "Network:"
+ip route | grep default
+echo "WiFi: $(iwgetid -r 2>/dev/null || echo 'Not connected')"
+EOF
+
+chmod +x /usr/local/bin/pi-status.sh
+
+# Create daily maintenance script
+print_status "Creating maintenance script..."
+cat > /usr/local/bin/daily-maintenance.sh << 'EOF'
+#!/bin/bash
+LOG_FILE="/var/log/pi-maintenance.log"
+
+echo "$(date): Starting daily maintenance" >> $LOG_FILE
+
+# Clean up old logs
+find /var/log -type f -name "*.log" -mtime +7 -delete 2>/dev/null
+
+# Clean Plex transcoding cache
+rm -rf /tmp/plex-transcode/* 2>/dev/null
+
+# Update Pi-hole blocklists
+pihole -g >> $LOG_FILE 2>&1
+
+# Sync system time
+ntpdate -s time.nist.gov >> $LOG_FILE 2>&1
+
+# Log system status
+/usr/local/bin/pi-status.sh >> $LOG_FILE
+
+echo "$(date): Daily maintenance completed" >> $LOG_FILE
+EOF
+
+chmod +x /usr/local/bin/daily-maintenance.sh
+
+# Add to crontab
+(crontab -l 2>/dev/null; echo "0 3 * * * /usr/local/bin/daily-maintenance.sh") | crontab -
+
+# Create web dashboard
+print_status "Creating web dashboard..."
+mkdir -p /var/www/html/dashboard
+cat > /var/www/html/dashboard/index.html << 'EOF'
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Pi Travel Router Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
+        .container { max-width: 800px; margin: 0 auto; }
+        .card { background: white; padding: 20px; margin: 10px 0; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .service-links { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }
+        .service-link { display: block; padding: 15px; text-align: center; color: white; text-decoration: none; border-radius: 5px; }
+        .plex { background-color: #e5a00d; }
+        .syncthing { background-color: #0891b2; }
+        .pihole { background-color: #96060c; }
+        .omv { background-color: #1f2937; }
+        h1 { text-align: center; color: #333; }
+        .status { font-family: monospace; background: #f8f9fa; padding: 10px; border-radius: 4px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🥧 Pi Travel Router Dashboard</h1>
+        
+        <div class="card">
+            <h2>Quick Access</h2>
+            <div class="service-links">
+                <a href="http://192.168.1.100:32400" class="service-link plex">📺 Plex Media Server</a>
+                <a href="http://192.168.1.100:8384" class="service-link syncthing">🔄 Syncthing</a>
+                <a href="http://192.168.1.100/admin" class="service-link pihole">🛡️ Pi-hole</a>
+                <a href="http://192.168.1.100" class="service-link omv">💾 OpenMediaVault</a>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h2>System Information</h2>
+            <div class="status" id="status">Loading system status...</div>
+        </div>
+        
+        <div class="card">
+            <h2>Quick Setup Guide</h2>
+            <ol>
+                <li>Connect router to internet (ethernet preferred)</li>
+                <li>Join "FamilyTravel" WiFi network</li>
+                <li>Access services using links above</li>
+                <li>Upload media via OpenMediaVault</li>
+                <li>Stream content via Plex</li>
+            </ol>
+        </div>
+    </div>
+    
+    <script>
+        // Simple status update
+        function updateStatus() {
+            fetch('/cgi-bin/status.sh')
+                .then(response => response.text())
+                .then(data => {
+                    document.getElementById('status').innerText = data;
+                })
+                .catch(error => {
+                    document.getElementById('status').innerText = 'Status update failed';
+                });
+        }
+        
+        // Update status every 30 seconds
+        setInterval(updateStatus, 30000);
+        updateStatus();
+    </script>
+</body>
+</html>
+EOF
+
+# Create status CGI script
+mkdir -p /usr/lib/cgi-bin
+cat > /usr/lib/cgi-bin/status.sh << 'EOF'
+#!/bin/bash
+echo "Content-Type: text/plain"
+echo ""
+/usr/local/bin/pi-status.sh
+EOF
+
+chmod +x /usr/lib/cgi-bin/status.sh
+
+# Configure nginx
+cat > /etc/nginx/sites-available/pi-dashboard << 'EOF'
+server {
+    listen 8080;
+    server_name _;
+    root /var/www/html/dashboard;
+    index index.html;
+    
+    location /cgi-bin/ {
+        gzip off;
+        root /usr/lib;
+        fastcgi_pass unix:/var/run/fcgiwrap.socket;
+        include /etc/nginx/fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    }
+}
+EOF
+
+ln -sf /etc/nginx/sites-available/pi-dashboard /etc/nginx/sites-enabled/
+apt install -y fcgiwrap
+systemctl enable nginx fcgiwrap
+systemctl start nginx fcgiwrap
+
+# Final system optimization for Pi
+print_status "Applying Pi optimizations..."
+
+# Configure swap
+dphys-swapfile swapoff
+sed -i 's/#CONF_SWAPSIZE=100/CONF_SWAPSIZE=1024/' /etc/dphys-swapfile
+dphys-swapfile setup
+dphys-swapfile swapon
+
+# Optimize SD card performance
+echo 'tmpfs /tmp tmpfs defaults,noatime,nosuid,size=100m 0 0' >> /etc/fstab
+echo 'tmpfs /var/tmp tmpfs defaults,noatime,nosuid,size=30m 0 0' >> /etc/fstab
+
+# Configure log rotation
+cat > /etc/logrotate.d/pi-travel-router << 'EOF'
+/var/log/pi-maintenance.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+}
+EOF
+
+print_status "✅ Installation complete!"
+echo ""
+echo "🎉 Pi Travel Router is now installed!"
+echo ""
+echo "Next steps:"
+echo "  1. Reboot the Pi: sudo reboot"
+echo "  2. Access dashboard: http://192.168.1.100:8080"
+echo "  3. Configure your router to use Pi as DNS: 192.168.1.100"
+echo "  4. Upload media via OpenMediaVault"
+echo "  5. Set up Syncthing with your home devices"
+echo ""
+echo "Service URLs:"
+echo "  📺 Plex: http://192.168.1.100:32400"
+echo "  🔄 Syncthing: http://192.168.1.100:8384"  
+echo "  🛡️ Pi-hole: http://192.168.1.100/admin"
+echo "  💾 OpenMediaVault: http://192.168.1.100"
+echo "  📊 Dashboard: http://192.168.1.100:8080"
+echo ""
+echo "🚀 Happy travels!"
+
+---
+
+# Makefile - Development Tasks
+.PHONY: help setup test lint format security hardware-test clean install
+
+help:
+	@echo "Pi Travel Router Development Commands"
+	@echo "===================================="
+	@echo "  setup           Initialize development environment"
+	@echo "  test            Run all tests"
+	@echo "  test-hardware   Test specific hardware configuration"
+	@echo "  lint            Run code linting"
+	@echo "  format          Format code"
+	@echo "  security        Run security scans"
+	@echo "  install-pi      Install services on Raspberry Pi"
+	@echo "  docker-test     Run tests in Docker containers"
+	@echo "  clean           Clean up generated files"
+
+setup:
+	@echo "🔧 Setting up development environment..."
+	bash scripts/setup.sh
+
+test:
+	@echo "🧪 Running tests..."
+	python -m pytest tests/ -v --tb=short
+
+test-hardware:
+	@echo "🔬 Running hardware-specific tests..."
+	@read -p "Pi Model (3b-plus/4b): " PI_MODEL; \
+	read -p "Router Model (netgear-r6230): " ROUTER_MODEL; \
+	python scripts/test-hardware.py --pi-model $PI_MODEL --router-model $ROUTER_MODEL
+
+lint:
+	@echo "🔍 Running linters..."
+	shellcheck scripts/*.sh
+	python -m flake8 scripts/
+	ansible-lint ansible/ || true
+
+format:
+	@echo "✨ Formatting code..."
+	black scripts/
+	isort scripts/
+
+security:
+	@echo "🔒 Running security scans..."
+	bandit -r scripts/ || true
+	safety check || true
+
+install-pi:
+	@echo "🥧 Installing on Raspberry Pi..."
+	@if grep -q "Raspberry Pi" /proc/cpuinfo; then \
+		sudo bash scripts/install-services.sh; \
+	else \
+		echo "❌ Not running on Raspberry Pi"; \
+		exit 1; \
+	fi
+
+docker-test:
+	@echo "🐳 Running Docker tests..."
+	docker-compose -f docker/docker-compose.test.yml up --abort-on-container-exit
+	docker-compose -f docker/docker-compose.test.yml down
+
+clean:
+	@echo "🧹 Cleaning up..."
+	rm -rf __pycache__ .pytest_cache .coverage
+	rm -rf test-results/ hardware-test-results/
+	rm -rf logs/*.log
+	docker system prune -f
+
+---
+
+# Project Directory Structure for Raspberry Pi
+pi-travel-router/
+├── .github/
+│   ├── workflows/
+│   │   ├── main.yml
+│   │   ├── hardware-test.yml
+│   │   └── community-contribution.yml
+│   ├── ISSUE_TEMPLATE/
+│   │   ├── bug_report.yml
+│   │   ├── feature_request.yml
+│   │   └── hardware_compatibility.yml
+│   └── dependabot.yml
+├── ansible/
+│   ├── playbooks/
+│   │   ├── site.yml
+│   │   ├── pi-setup.yml
+│   │   └── router-config.yml
+│   ├── roles/
+│   │   ├── plex/
+│   │   ├── syncthing/
+│   │   ├── pihole/
+│   │   └── openmediavault/
+│   └── inventory/
+│       └── hosts.yml
+├── configs/
+│   ├── examples/
+│   │   ├── plex.yml
+│   │   ├── syncthing.yml
+│   │   ├── pihole.yml
+│   │   └── network.yml
+│   ├── templates/
+│   │   ├── nginx.conf.j2
+│   │   └── docker-compose.yml.j2
+│   └── hardware/
+│       ├── pi-3b-plus.yml
+│       ├── pi-4b.yml
+│       └── routers/
+├── docker/
+│   ├── Dockerfile
+│   ├── Dockerfile.test
+│   ├── docker-compose.yml
+│   └── docker-compose.test.yml
+├── docs/
+│   ├── setup/
+│   │   ├── raspberry-pi.md
+│   │   ├── router-configuration.md
+│   │   └── first-time-setup.md
+│   ├── hardware/
+│   │   ├── compatibility-list.md
+│   │   ├── performance-benchmarks.md
+│   │   └── optimization-guide.md
+│   ├── troubleshooting/
+│   │   ├── common-issues.md
+│   │   ├── performance-problems.md
+│   │   └── network-issues.md
+│   └── mkdocs.yml
+├── scripts/
+│   ├── setup.sh
+│   ├── install-services.sh
+│   ├── test-hardware.py
+│   ├── detect-hardware.py
+│   ├── generate-compatibility-report.py
+│   ├── optimize-pi.sh
+│   └── backup-config.sh
+├── tests/
+│   ├── unit/
+│   ├── integration/
+│   ├── hardware/
+│   │   ├── pi-3b-plus/
+│   │   └── pi-4b/
+│   ├── performance/
+│   └── conftest.py
+├── web/
+│   ├── dashboard/
+│   │   ├── index.html
+│   │   ├── style.css
+│   │   └── script.js
+│   └── api/
+│       └── status.py
+├── requirements.txt
+├── requirements-dev.txt
+├── requirements-test.txt
+├── Makefile
+├── README.md
+├── INSTALL.md
+├── CONTRIBUTING.md
+└── LICENSE
+
+---
+
+# INSTALL.md - Quick Installation Guide
+# Pi Travel Router - Quick Install Guide
+
+## 🚀 Quick Start (15 minutes)
+
+### Step 1: Prepare Raspberry Pi
+```bash
+# Flash Raspberry Pi OS Lite to SD card
+# Boot Pi and SSH in (or use keyboard/monitor)
+ssh pi@raspberrypi.local
+```
+
+### Step 2: Download and Install
+```bash
+# One-line installer
+curl -sSL https://raw.githubusercontent.com/USERNAME/pi-travel-router/main/scripts/setup.sh | bash
+
+# Or manual download
+git clone https://github.com/USERNAME/pi-travel-router.git
+cd pi-travel-router
+sudo bash scripts/install-services.sh
+```
+
+### Step 3: Configure Router
+1. Connect router to internet
+2. Set router DNS to Pi IP: `192.168.1.100`
+3. Create family WiFi network: `FamilyTravel`
+
+### Step 4: Access Services
+- 📊 Dashboard: http://192.168.1.100:8080
+- 📺 Plex: http://192.168.1.100:32400
+- 🔄 Syncthing: http://192.168.1.100:8384
+- 🛡️ Pi-hole: http://192.168.1.100/admin
+
+## ✅ You're Ready to Travel!
+
+For detailed setup instructions, see the [full documentation](docs/setup/raspberry-pi.md).
+
+---
+
+**🎯 Total Setup Time: 15-30 minutes**
+**💰 Total Cost: ~$200-250**
+**🚀 Ready for Family Adventures!**
